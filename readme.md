@@ -6,7 +6,7 @@
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/xl337x/AuthFinder/refs/heads/main/authfinder-ng -o /usr/local/bin/authfinder && chmod +x /usr/local/bin/authfinder
-
+```
 ---
 
 ## Supported Protocols
