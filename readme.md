@@ -1,9 +1,11 @@
 # authfinder-ng
 
 > Multi-Protocol Access Discovery & Command Execution Engine for Windows environments.
-> onelinner installation with aliasing? curl -sSL https://raw.githubusercontent.com/xl337x/AuthFinder/refs/heads/main/authfinder-ng -o /usr/local/bin/authfinder && chmod +x /usr/local/bin/authfinder
 
-Automatically tests credentials across multiple protocols, identifies execution vectors, and generates ready-to-use follow-up commands.
+### 🚀 One-liner Installation (with aliasing)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/xl337x/AuthFinder/refs/heads/main/authfinder-ng -o /usr/local/bin/authfinder && chmod +x /usr/local/bin/authfinder
 
 ---
 
