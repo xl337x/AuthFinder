@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  authfinder-ng v3.0 — Advanced Multi-Protocol Access Discovery Engine   ║
-# ║  Red Team | Penetration Testing | MSSP Daily Driver                     ║
+# ║  Red Team | Penetration Testing | @Mahdiesta                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 VERSION="3.0"
