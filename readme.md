@@ -211,5 +211,3 @@ Set-ItemProperty -Path ... -Name EnableScriptBlockLogging -Value 0
 ```
 
 ---
-
-> **Disclaimer:** For authorized penetration testing and CTF use only.
